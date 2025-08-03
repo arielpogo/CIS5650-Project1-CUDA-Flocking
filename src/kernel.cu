@@ -223,17 +223,87 @@ void Boids::copyBoidsToVBO(float *vbodptr_positions, float *vbodptr_velocities) 
 * stepSimulation *
 ******************/
 
+
+
 /**
 * LOOK-1.2 You can use this as a helper for kernUpdateVelocityBruteForce.
 * __device__ code can be called from a __global__ context
 * Compute the new velocity on the body with index `iSelf` due to the `N` boids
 * in the `pos` and `vel` arrays.
 */
-__device__ glm::vec3 computeVelocityChange(int N, int iSelf, const glm::vec3 *pos, const glm::vec3 *vel) {
-  // Rule 1: boids fly towards their local perceived center of mass, which excludes themselves
-  // Rule 2: boids try to stay a distance d away from each other
-  // Rule 3: boids try to match the speed of surrounding boids
-  return glm::vec3(0.0f, 0.0f, 0.0f);
+__device__ glm::vec3 computeVelocityChange(const int N, const int iSelf, const glm::vec3 *pos, const glm::vec3 *vel) 
+{
+    // Rule 1: boids fly towards their local perceived center of mass, which excludes themselves
+    // Rule 2: boids try to stay a distance d away from each other
+    // Rule 3: boids try to match the speed of surrounding boids
+
+    //rule 1 vars
+    glm::vec3 percieved_center {0.0f, 0.0f, 0.0f};
+    int rule1Neighbors = 0;
+
+    //rule 2 vars
+    glm::vec3 c {0.0f, 0.0f, 0.0f};
+
+    //rule 3 vars
+    glm::vec3 percieved_veloctiy {0.0f, 0.0f, 0.0f};
+    int rule3Neighbors = 0;
+
+    
+    const glm::vec3 myPos = pos[iSelf];
+
+    for (int boid = 0; boid < N; ++boid)
+    {
+        if (boid == iSelf)
+            continue;
+
+        const glm::vec3 otherPos = pos[boid];
+
+        const float distance = glm::distance(myPos, otherPos);
+
+        //rule 1
+        if (distance < rule1Distance)
+        {
+            ++rule1Neighbors;
+            percieved_center += otherPos;
+        }
+
+        //rule 2
+        if (distance < rule2Distance)
+            c -= (myPos - otherPos);
+
+        //rule 3
+        if (distance < rule3Distance)
+        {
+            ++rule3Neighbors;
+
+            const glm::vec3* pOtherVelocity = vel + boid;
+            percieved_veloctiy += *pOtherVelocity;
+        }
+    }
+
+    //Rule 1
+    if (rule1Neighbors > 0)
+    {
+        percieved_center /= (float) rule1Neighbors;
+        percieved_center -= myPos;
+        percieved_center *= rule1Scale;
+    }
+    else 
+        percieved_center = glm::vec3(0.0f, 0.0f, 0.0f);
+
+    //Rule 2
+    c *= rule2Scale;
+
+    //Rule 3
+    if (rule3Neighbors > 0)
+    {
+        percieved_veloctiy /= (float) rule3Neighbors;
+        percieved_veloctiy *= rule3Scale;
+    }
+    else
+        percieved_veloctiy = glm::vec3(0.0f, 0.0f, 0.0f);
+
+    return percieved_center + c + percieved_veloctiy;
 }
 
 /**
@@ -241,35 +311,56 @@ __device__ glm::vec3 computeVelocityChange(int N, int iSelf, const glm::vec3 *po
 * For each of the `N` bodies, update its position based on its current velocity.
 */
 __global__ void kernUpdateVelocityBruteForce(int N, glm::vec3 *pos,
-  glm::vec3 *vel1, glm::vec3 *vel2) {
+  glm::vec3 *vel1, glm::vec3 *vel2) 
+{
   // Compute a new velocity based on pos and vel1
   // Clamp the speed
   // Record the new velocity into vel2. Question: why NOT vel1?
+    //answer: because the blocks are scheduled in an unknown order, we do not want to introduce a race condition whereby the velocities of other boids were updated to their next state before we had a chance to look at them for our current instant
+
+    int index = threadIdx.x + (blockIdx.x * blockDim.x);
+
+    if (index >= N)
+        return;
+
+    //my velocity plus the change
+    glm::vec3 newSpeed = *(vel1 + index) + computeVelocityChange(N, index, pos, vel1);
+
+    if (glm::length(newSpeed) > maxSpeed) //clamp magnitude
+    {
+        newSpeed = glm::normalize(newSpeed); //preserve direction
+        newSpeed *= maxSpeed; //set magnitude to the max.
+    }
+
+    //my position plus the change into vec2
+    *(vel2 + index) = newSpeed;
 }
 
 /**
 * LOOK-1.2 Since this is pretty trivial, we implemented it for you.
 * For each of the `N` bodies, update its position based on its current velocity.
 */
-__global__ void kernUpdatePos(int N, float dt, glm::vec3 *pos, glm::vec3 *vel) {
-  // Update position by velocity
-  int index = threadIdx.x + (blockIdx.x * blockDim.x);
-  if (index >= N) {
-    return;
-  }
-  glm::vec3 thisPos = pos[index];
-  thisPos += vel[index] * dt;
+__global__ void kernUpdatePos(const int N, float dt, glm::vec3 *pos, const glm::vec3 *vel) 
+{
+    // Update position by velocity
+    int index = threadIdx.x + (blockIdx.x * blockDim.x);
 
-  // Wrap the boids around so we don't lose them
-  thisPos.x = thisPos.x < -scene_scale ? scene_scale : thisPos.x;
-  thisPos.y = thisPos.y < -scene_scale ? scene_scale : thisPos.y;
-  thisPos.z = thisPos.z < -scene_scale ? scene_scale : thisPos.z;
+    if (index >= N) 
+        return;
 
-  thisPos.x = thisPos.x > scene_scale ? -scene_scale : thisPos.x;
-  thisPos.y = thisPos.y > scene_scale ? -scene_scale : thisPos.y;
-  thisPos.z = thisPos.z > scene_scale ? -scene_scale : thisPos.z;
+    glm::vec3 thisPos = pos[index];
+    thisPos += vel[index] * dt;
 
-  pos[index] = thisPos;
+    // Wrap the boids around so we don't lose them
+    thisPos.x = thisPos.x < -scene_scale ? scene_scale : thisPos.x;
+    thisPos.y = thisPos.y < -scene_scale ? scene_scale : thisPos.y;
+    thisPos.z = thisPos.z < -scene_scale ? scene_scale : thisPos.z;
+    
+    thisPos.x = thisPos.x > scene_scale ? -scene_scale : thisPos.x;
+    thisPos.y = thisPos.y > scene_scale ? -scene_scale : thisPos.y;
+    thisPos.z = thisPos.z > scene_scale ? -scene_scale : thisPos.z;
+
+    pos[index] = thisPos;
 }
 
 // LOOK-2.1 Consider this method of computing a 1D index from a 3D grid index.
@@ -346,10 +437,24 @@ __global__ void kernUpdateVelNeighborSearchCoherent(
 /**
 * Step the entire N-body simulation by `dt` seconds.
 */
-void Boids::stepSimulationNaive(float dt) {
-  // TODO-1.2 - use the kernels you wrote to step the simulation forward in time.
-  // TODO-1.2 ping-pong the velocity buffers
+void Boids::stepSimulationNaive(float dt) 
+{
+    // TODO-1.2 - use the kernels you wrote to step the simulation forward in time.
+    // TODO-1.2 ping-pong the velocity buffers
+
+    static dim3 fullBlocksPerGrid((numObjects + blockSize - 1) / blockSize);
+    
+    //take the values of dev_vel1 and compute new velocity into dev_vel2
+    kernUpdateVelocityBruteForce<<<fullBlocksPerGrid, blockSize>>>(numObjects, dev_pos, dev_vel1, dev_vel2);
+
+    //actually update the positions
+    kernUpdatePos<<<fullBlocksPerGrid, blockSize>>>(numObjects, dt, dev_pos, dev_vel2);
+
+    //ping pong the velocity buffers
+    std::swap(dev_vel1, dev_vel2);
 }
+
+
 
 void Boids::stepSimulationScatteredGrid(float dt) {
   // TODO-2.1
